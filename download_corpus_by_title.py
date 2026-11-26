@@ -61,13 +61,13 @@ import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import openpyxl
 
 # ===== 路径与常量 =====
 SCRIPT_DIR = Path(__file__).resolve().parent
-EXCEL_FILE = SCRIPT_DIR / "20261108-语料整理表.xlsx"
+EXCEL_FILE = SCRIPT_DIR / "未下载_无DOI_1.xlsx"
 OUTPUT_DIR = SCRIPT_DIR / "data"
 PDF_DIR = OUTPUT_DIR / "PDFs"
 PROGRESS_FILE = OUTPUT_DIR / "title_search_progress.json"
@@ -765,14 +765,30 @@ def page_state(page):
     if (any(k in url for k in ("/verify", "/bar/verify", "captcha"))
             or any(k in title for k in ("安全验证", "拼图校验", "验证码"))):
         return "verify"
-    if ("login" in url or "passport" in url
-            or ("登录" in title and "拼图" not in title)):
-        return "login"
+
+    # 只有明确的登录域名/路径才判登录，不能搜 URL 任意位置含 login
     try:
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+    except Exception:
+        host, path = "", ""
+    if (host.endswith("login.cnki.net") or "passport" in host
+            or path.startswith("/login") or path.startswith("/user/login")):
+        return "login"
+
+    # 真正的内容标记优先，避免文章标题里含「登录」时被误判
+    try:
+        if page.locator("#pdfDown, #cajDown, #txt_search, "
+                        ".result-table-list, #gridTable").count() > 0:
+            return "ok"
         if page.locator("#TextBoxUserName").count() > 0:
             return "login"
     except Exception:
         pass
+
+    if "登录" in title and "拼图" not in title and "安全验证" not in title:
+        return "login"
     return "ok"
 
 
@@ -866,14 +882,18 @@ def get_detail_title(page):
 
 
 def wait_for_detail_ready(page, args, hard_timeout=45):
-    """等待详情页可读；期间允许人工通过滑块/重新登录。"""
+    """等待详情页可读；期间允许人工通过滑块/重新登录。
+
+    发现验证/登录后按 --captcha-wait / --login-wait 等待（0 = 不限时），
+    不再被 hard_timeout 提前打断。
+    """
     start = time.time()
     captcha_deadline = None
     login_deadline = None
     noticed_verify = False
     noticed_login = False
 
-    while time.time() - start < hard_timeout:
+    while True:
         if page.is_closed():
             return False
 
@@ -909,12 +929,15 @@ def wait_for_detail_ready(page, args, hard_timeout=45):
         else:
             return False
 
+        # 尚未出现验证/登录时，只用 hard_timeout 兜底
+        if (not noticed_verify and not noticed_login
+                and time.time() - start > hard_timeout):
+            return False
+
         try:
             page.wait_for_timeout(500)
         except Exception:
             return False
-
-    return False
 
 
 def wait_for_download(context, downloads, start_index, timeout, login_timeout=None):
@@ -1474,6 +1497,7 @@ def process_article_download(context, search_page, downloads, article, args, pro
 # ===== 待处理筛选 =====
 def select_pending_articles(articles, progress, args):
     pending = []
+    skipped = Counter()
     records = progress["records"]
 
     for article in articles:
@@ -1512,6 +1536,7 @@ def select_pending_articles(articles, progress, args):
             continue
 
         if status in RETRYABLE_STATUSES and not args.retry_failed:
+            skipped[status] += 1
             continue
 
         if status == "matched" and args.phase == "search":
@@ -1521,7 +1546,7 @@ def select_pending_articles(articles, progress, args):
 
     if args.max_articles:
         pending = pending[:args.max_articles]
-    return pending
+    return pending, skipped
 
 
 # ===== 主流程 =====
@@ -1562,8 +1587,13 @@ def run(args):
                 removed += 1
         log.info(f"--retry-failed：已清除 {removed} 条可重试失败记录")
 
-    pending = select_pending_articles(no_doi, progress, args)
+    pending, skipped = select_pending_articles(no_doi, progress, args)
     save_progress(progress)
+
+    if skipped:
+        detail = "，".join(f"{k} {v}" for k, v in skipped.most_common())
+        log.info(f"已跳过历史失败 {sum(skipped.values())} 篇（{detail}）；"
+                 f"--retry-failed 可重试")
 
     log.info(f"本次待处理: {len(pending)} 篇 | 阶段: {args.phase}")
     if not pending:

@@ -30,6 +30,7 @@ CNKI 语料 PDF 下载工具
 import os
 import re
 import sys
+import csv
 import json
 import time
 import logging
@@ -44,7 +45,7 @@ import openpyxl
 import requests
 
 # ===== 配置 =====
-EXCEL_FILE = "20261108-语料整理表.xlsx"
+EXCEL_FILE = "未下载_含DOI.xlsx"
 SHEET_INDEX = 0  # Sheet 0 = 语料（中文）, Sheet 1 = 3739篇（英文）
 OUTPUT_DIR = "data"
 COOKIES_FILE = os.path.join(OUTPUT_DIR, "cnki_cookies.json")
@@ -65,6 +66,25 @@ HEADERS = {
 
 # 下载延迟（秒）
 REQUEST_DELAY = 2.0
+
+# 永久性解析失败（后续运行直接跳过，--retry-failed 可重试）
+PERMANENT_RESOLVE_STATUSES = {"doi_not_found", "no_pdf"}
+UNRESOLVED_CSV = os.path.join(OUTPUT_DIR, "unresolved_articles.csv")
+ARTICLE_URL_RE = re.compile(r"kns\.cnki\.net/kcms2?/(?:article|detail)/", re.I)
+DOWNLOAD_MARKERS = ("pdfDown", "cajDown", "btn-dlpdf", "btn-dlcaj",
+                    "bar.cnki.net/bar/download/order")
+
+STATUS_LABELS = {
+    "doi_not_found": "DOI未注册或已失效",
+    "no_pdf": "文章页无PDF/CAJ下载链接",
+    "login_required": "需要登录认证",
+    "not_article": "未进入知网文章页",
+    "resolve_failed": "DOI跳转异常",
+    "error": "HTTP请求失败",
+    "exception": "解析请求异常",
+    "legacy_failed": "历史解析失败（旧版记录）",
+    "download_failed": "历史下载失败（未保存PDF）",
+}
 
 # ===== 日志配置 =====
 logging.basicConfig(
@@ -133,11 +153,123 @@ def save_progress(progress):
 
 
 def load_progress():
-    """加载下载进度"""
+    """加载下载进度，并兼容旧版本缺失的字段"""
+    progress = {}
     if os.path.exists(PROGRESS_FILE):
         with open(PROGRESS_FILE, "rb") as f:
-            return pickle.load(f)
-    return {"downloaded": set(), "failed": set(), "no_pdf": set()}
+            progress = pickle.load(f)
+    progress.setdefault("downloaded", set())
+    progress.setdefault("failed", set())
+    progress.setdefault("no_pdf", set())  # 旧字段，保留兼容，不再使用
+    progress.setdefault("urls", [])
+    if not isinstance(progress.get("unresolved"), dict):
+        progress["unresolved"] = {}
+    return progress
+
+
+def make_failure_record(article, status, detail, page_url):
+    """构造一条无法解析的记录（写入 progress["unresolved"] 或 CSV）"""
+    doi = article.get("doi") or article.get("title", "")[:40]
+    return {
+        "no": article.get("no"),
+        "id": doi,
+        "doi": article.get("doi"),
+        "title": article.get("title", ""),
+        "status": status,
+        "reason": detail or "",
+        "page_url": page_url or "",
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def write_unresolved_csv(unresolved):
+    """把永久未解决的文章写成可读清单（utf-8-sig，Excel 可直接打开）"""
+    ensure_dir(OUTPUT_DIR)
+    rows = sorted(
+        unresolved.values(),
+        key=lambda r: (r.get("no") is None, r.get("no") or 0),
+    )
+    tmp = UNRESOLVED_CSV + ".tmp"
+    with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["序号", "DOI", "标题", "状态", "状态说明", "原因", "页面URL", "记录时间"])
+        for r in rows:
+            status = r.get("status", "")
+            writer.writerow([
+                r.get("no", ""), r.get("doi", ""), r.get("title", ""),
+                status, STATUS_LABELS.get(status, status),
+                r.get("reason", ""), r.get("page_url", ""), r.get("ts", ""),
+            ])
+    os.replace(tmp, UNRESOLVED_CSV)
+
+
+def write_download_manifest(articles, progress, pdf_dir):
+    """按 Excel 顺序生成全量清单和断点文件，便于核对/恢复"""
+    unresolved = progress.get("unresolved", {})
+    downloaded = progress.get("downloaded", set())
+    rows = []
+    seen = set()
+    pending_count = 0
+    next_article = None
+
+    for a in articles:
+        doi = (a.get("doi") or "").strip()
+        if doi:
+            if doi in seen:
+                continue
+            seen.add(doi)
+        save_path = os.path.join(pdf_dir, make_filename(a["no"], a["title"]))
+        if is_valid_pdf(save_path) or (doi and doi in downloaded):
+            state, note = "已下载", os.path.basename(save_path)
+        elif not doi:
+            state, note = "无DOI（跳过）", ""
+        elif doi in unresolved:
+            rec = unresolved[doi]
+            state = "永久失败"
+            note = STATUS_LABELS.get(rec.get("status"), rec.get("status", ""))
+        else:
+            state, note = "待处理", ""
+            pending_count += 1
+            if next_article is None:
+                next_article = a
+        rows.append([a.get("no"), a.get("title"), a.get("journal"),
+                     a.get("year"), doi, state, note])
+
+    manifest_path = os.path.join(OUTPUT_DIR, "download_manifest.csv")
+    tmp = manifest_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["序号", "标题", "期刊", "年份", "DOI", "状态", "说明/文件"])
+        writer.writerows(rows)
+    os.replace(tmp, manifest_path)
+
+    checkpoint = {
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "excel": EXCEL_FILE,
+        "total_rows": len(rows),
+        "downloaded_pdfs": len(downloaded),
+        "marked_permanent_failed": len(unresolved),
+        "remaining_pending": pending_count,
+        "next_article": ({"no": next_article.get("no"),
+                          "title": next_article.get("title"),
+                          "doi": next_article.get("doi")}
+                         if next_article else None),
+    }
+    checkpoint_path = os.path.join(OUTPUT_DIR, "resume_checkpoint.json")
+    with open(checkpoint_path, "w", encoding="utf-8") as f:
+        json.dump(checkpoint, f, ensure_ascii=False, indent=2)
+
+
+def sanitize_url_records(records):
+    """丢弃旧版本写入的临时失败记录（如 login_required），避免被永久跳过"""
+    kept, dropped = [], 0
+    for r in records:
+        status = r.get("status")
+        if status and status != "urls_extracted":
+            dropped += 1
+            continue
+        kept.append(r)
+    return kept, dropped
 
 
 def is_chinese(text):
@@ -216,10 +348,56 @@ def read_corpus_excel(filepath, sheet_index=0, only_chinese=True):
 
 
 # ===== DOI → CNKI 摘要页 → PDF下载链接 =====
-def resolve_doi_to_cnki(session, doi):
+def _url_host(url):
+    try:
+        return (urlparse(url or "").netloc or "").lower()
+    except Exception:
+        return ""
+
+
+def classify_resolution(final_url, status_code, html):
+    """根据最终 URL 和页面内容判定解析结果，返回 (status, detail)。
+
+    注意：不能用页面里是否出现「登录」判断 —— doi.cnki.net 首页也有「登录」。
     """
-    通过 link.cnki.net/doi/{doi} 解析DOI到知网详情页
-    返回: (status, article_url, html_content)
+    if status_code != 200:
+        return "error", f"HTTP {status_code}"
+
+    url = final_url or ""
+    host = _url_host(url)
+    path = (urlparse(url).path or "/").lower()
+    text = html or ""
+    low = text.lower()
+
+    # 知网页面：有下载按钮即文章页；无按钮但有登录表单则是登录墙
+    if host.endswith("kns.cnki.net"):
+        if any(m in text for m in DOWNLOAD_MARKERS):
+            return "ok", ""
+        if re.search(r'id=["\']textboxusername["\']', low):
+            return "login_required", "页面为知网登录表单"
+        if ARTICLE_URL_RE.search(url):
+            return "ok", ""
+        return "not_article", f"未进入知网文章页: {url}"
+
+    # 失效/未注册 DOI 会被 link.cnki.net 重定向到 DOI 注册中心首页
+    if host.endswith("doi.cnki.net"):
+        if path.rstrip("/") in ("", "/home", "/home/index"):
+            return "doi_not_found", "DOI未注册或已失效（跳转到 doi.cnki.net 首页）"
+        return "resolve_failed", f"跳转到 doi.cnki.net 非文章页: {url}"
+
+    if (host.endswith("login.cnki.net") or "passport" in host
+            or path.startswith("/login") or path.startswith("/user/login")
+            or re.search(r'id=["\']textboxusername["\']', low)):
+        return "login_required", f"跳转到登录页: {host or url}"
+
+    return "resolve_failed", f"未识别的跳转地址: {url}"
+
+
+def resolve_doi_to_cnki(session, doi):
+    """通过 link.cnki.net/doi/{doi} 解析 DOI 到知网文章页。
+
+    返回 (status, article_url, html_content, detail)。
+    仅 status == "ok" 时 html_content 非空。
     """
     doi_url = f"https://link.cnki.net/doi/{doi}"
     try:
@@ -228,15 +406,12 @@ def resolve_doi_to_cnki(session, doi):
             timeout=20,
             allow_redirects=True,
         )
-        if resp.status_code == 200:
-            # 检查是否登录页面或验证页面
-            if "登录" in resp.text and ("login" in resp.url.lower() or "kns.cnki.net" not in resp.url):
-                return ("login_required", resp.url, resp.text)
-            return ("ok", resp.url, resp.text)
-        else:
-            return ("error", resp.url, resp.text[:200])
     except Exception as e:
-        return ("exception", str(e), "")
+        return ("exception", "", "", str(e))
+
+    status, detail = classify_resolution(resp.url, resp.status_code, resp.text)
+    html = resp.text if status == "ok" else ""
+    return (status, resp.url, html, detail)
 
 
 def extract_download_urls(html_content):
@@ -409,6 +584,7 @@ def phase_extract(args):
 
     ensure_dir(OUTPUT_DIR)
     articles = read_corpus_excel(EXCEL_FILE, SHEET_INDEX, only_chinese=True)
+    all_articles = articles
     log.info(f"共 {len(articles)} 篇中文文章")
 
     # 过滤
@@ -421,17 +597,38 @@ def phase_extract(args):
 
     # 加载进度
     progress = load_progress()
+    if getattr(args, "retry_failed", False):
+        n_unresolved = len(progress["unresolved"])
+        progress["unresolved"].clear()
+        progress["failed"].clear()
+        progress["no_pdf"].clear()
+        save_progress(progress)
+        log.info(f"--retry-failed：已清空 {n_unresolved} 条永久未解决记录，本次重新解析")
+
     downloaded_urls = progress.get("urls", [])
     if not downloaded_urls and os.path.exists(DOWNLOAD_URLS_FILE):
         with open(DOWNLOAD_URLS_FILE, "r", encoding="utf-8") as f:
             downloaded_urls = json.load(f)
 
-    # 先剔除已处理过的文章，再按 max_articles 截断，
+    # 清理旧版本写入的临时失败记录（如 login_required），避免被永久跳过
+    downloaded_urls, dropped = sanitize_url_records(downloaded_urls)
+    if dropped:
+        log.info(f"已清理 {dropped} 条旧的临时失败记录，将重新解析")
+        with open(DOWNLOAD_URLS_FILE, "w", encoding="utf-8") as f:
+            json.dump(downloaded_urls, f, ensure_ascii=False, indent=2)
+        progress["urls"] = downloaded_urls
+        save_progress(progress)
+
+    # 先剔除已处理过的文章、永久未解决的，再按 max_articles 截断，
     # 这样多次运行 --max-articles N 才能持续推进到后面的文章
     processed_ids = {u.get("id") for u in downloaded_urls if u.get("id")}
+    unresolved = progress["unresolved"]
+    before = len(articles)
     articles = [a for a in articles
-                if (a.get("doi") or a["title"][:40]) not in processed_ids]
-    log.info(f"待处理新文章: {len(articles)} 篇")
+                if (a.get("doi") or a["title"][:40]) not in processed_ids
+                and a.get("doi") not in unresolved]
+    skipped_unresolved = before - len(articles)
+    log.info(f"待处理新文章: {len(articles)} 篇（已跳过已处理/永久未解决 {skipped_unresolved} 篇）")
 
     if args.max_articles and args.max_articles < len(articles):
         articles = articles[:args.max_articles]
@@ -441,7 +638,8 @@ def phase_extract(args):
     session.headers.update(HEADERS)
     apply_cookies_to_session(session)
 
-    stats = {"ok": 0, "login_required": 0, "error": 0, "no_url": 0, "skipped": 0}
+    stats = {"ok": 0, "doi_not_found": 0, "no_pdf": 0, "no_url": 0,
+             "login_required": 0, "transient": 0, "error": 0, "skipped": 0}
 
     for i, article in enumerate(articles):
         # 跳过已处理的
@@ -451,9 +649,10 @@ def phase_extract(args):
             continue
 
         if i % 10 == 0 and i > 0:
+            write_unresolved_csv(unresolved)
             log.info(f"进度: {i}/{len(articles)} | OK={stats['ok']} "
-                     f"Login={stats['login_required']} Error={stats['error']} "
-                     f"NoURL={stats['no_url']} Skipped={stats['skipped']}")
+                     f"DOI失效={stats['doi_not_found']} NoPDF={stats['no_pdf']} "
+                     f"临时失败={stats['transient']} Skipped={stats['skipped']}")
 
         title_short = article["title"][:50]
 
@@ -462,9 +661,9 @@ def phase_extract(args):
             log.info(f"[{i+1}/{len(articles)}] DOI: {article['doi']}")
             log.info(f"  标题: {title_short}")
 
-            status, page_url, html = resolve_doi_to_cnki(session, article["doi"])
+            status, page_url, html, detail = resolve_doi_to_cnki(session, article["doi"])
 
-            if status == "ok":
+            if status == "ok" and html:
                 urls = extract_download_urls(html)
                 page_title = get_article_title_from_page(html)
 
@@ -487,28 +686,29 @@ def phase_extract(args):
                     stats["ok"] += 1
                     log.info(f"  ✓ 找到PDF下载链接")
                 else:
+                    fail = make_failure_record(
+                        article, "no_pdf", "文章页无 PDF/CAJ 下载链接", page_url)
+                    unresolved[fail["id"]] = fail
+                    stats["no_pdf"] += 1
                     stats["no_url"] += 1
-                    log.warning(f"  ✗ 未找到下载链接")
+                    log.warning("  ✗ 文章页无 PDF/CAJ 下载链接，已永久跳过")
 
-            elif status == "login_required":
-                record = {
-                    "no": article["no"],
-                    "id": article["doi"],
-                    "title": article["title"],
-                    "doi": article["doi"],
-                    "page_url": page_url,
-                    "pdf_urls": [],
-                    "caj_urls": [],
-                    "has_pdf": False,
-                    "has_caj": False,
-                    "status": "login_required",
-                }
-                downloaded_urls.append(record)
-                stats["login_required"] += 1
-                log.warning(f"  ! 需要登录认证")
-            else:
+            elif status == "ok":
                 stats["error"] += 1
-                log.warning(f"  ✗ 解析失败: {status}")
+                log.warning("  ! 文章页内容为空，本次跳过（下次重试）")
+
+            elif status in PERMANENT_RESOLVE_STATUSES:
+                fail = make_failure_record(article, status, detail, page_url)
+                unresolved[fail["id"]] = fail
+                stats[status] = stats.get(status, 0) + 1
+                log.warning(f"  ✗ {STATUS_LABELS.get(status, status)}，已永久跳过")
+
+            else:
+                stats["transient"] += 1
+                if status == "login_required":
+                    stats["login_required"] += 1
+                log.warning(f"  ! {STATUS_LABELS.get(status, status)}"
+                            f"（{detail}），本次跳过（下次重试）")
 
         else:
             # 无DOI：记录日志，后续处理
@@ -525,16 +725,28 @@ def phase_extract(args):
     # 保存最终结果
     with open(DOWNLOAD_URLS_FILE, "w", encoding="utf-8") as f:
         json.dump(downloaded_urls, f, ensure_ascii=False, indent=2)
+    progress["urls"] = downloaded_urls
+    save_progress(progress)
+    write_unresolved_csv(unresolved)
+    try:
+        write_download_manifest(
+            all_articles, progress, os.path.join(OUTPUT_DIR, "PDFs"))
+    except Exception as e:
+        log.warning(f"生成下载清单失败: {e}")
 
     log.info("=" * 60)
     log.info(f"提取完成:")
     log.info(f"  成功提取URL: {stats['ok']}")
+    log.info(f"  永久跳过(DOI失效): {stats['doi_not_found']}")
+    log.info(f"  永久跳过(无下载链接): {stats['no_pdf']}")
+    log.info(f"  临时失败(下次重试): {stats['transient']}")
     log.info(f"  需要登录: {stats['login_required']}")
-    log.info(f"  未找到URL: {stats['no_url']}")
     log.info(f"  解析错误: {stats['error']}")
     log.info(f"  已跳过: {stats['skipped']}")
     log.info(f"  总记录: {len(downloaded_urls)}")
+    log.info(f"  累计永久未解决: {len(unresolved)}")
     log.info(f"  URL文件: {DOWNLOAD_URLS_FILE}")
+    log.info(f"  未解决清单: {UNRESOLVED_CSV}")
     log.info("=" * 60)
 
 
@@ -1089,10 +1301,12 @@ def phase_download_browser(args):
 
 def extract_records_for_articles(session, articles, offset=0, total=None):
     """
-    为一批文章解析知网下载链接，只返回成功拿到URL的记录。
+    为一批文章解析知网下载链接。
+    返回 (records, failures)：records 为可下载记录，failures 为解析失败记录。
     用于 pipeline 阶段：解析完一小批后立即下载，避免 bar.cnki.net token 过期。
     """
     records = []
+    failures = []
     total = total if total is not None else len(articles)
 
     for i, article in enumerate(articles):
@@ -1106,15 +1320,25 @@ def extract_records_for_articles(session, articles, offset=0, total=None):
         log.info(f"[{idx}/{total}] DOI: {article['doi']}")
         log.info(f"  标题: {title[:50]}")
 
-        status, page_url, html = resolve_doi_to_cnki(session, article["doi"])
+        status, page_url, html, detail = resolve_doi_to_cnki(session, article["doi"])
+        if status == "ok" and not html:
+            status, detail = "error", "响应内容为空"
+
         if status != "ok":
-            log.warning(f"  ✗ 解析失败: {status}")
+            failures.append(make_failure_record(article, status, detail, page_url))
+            if status in PERMANENT_RESOLVE_STATUSES:
+                log.warning(f"  ✗ {STATUS_LABELS.get(status, status)}，已永久跳过")
+            else:
+                log.warning(f"  ! {STATUS_LABELS.get(status, status)}"
+                            f"（{detail}），本次跳过（下次重试）")
             time.sleep(REQUEST_DELAY)
             continue
 
         urls = extract_download_urls(html)
         if not (urls.get("pdf") or urls.get("caj")):
-            log.warning("  ✗ 未找到下载链接")
+            failures.append(make_failure_record(
+                article, "no_pdf", "文章页无 PDF/CAJ 下载链接", page_url))
+            log.warning("  ✗ 文章页无 PDF/CAJ 下载链接，已永久跳过")
             time.sleep(REQUEST_DELAY)
             continue
 
@@ -1134,13 +1358,14 @@ def extract_records_for_articles(session, articles, offset=0, total=None):
         log.info("  ✓ 找到下载链接")
         time.sleep(REQUEST_DELAY)
 
-    return records
+    return records, failures
 
 
 def phase_pipeline(args):
     """
     边提取边下载：每批解析 chunk-size 篇文章的链接后立即下载。
-    - 失败的文章下次运行会重试，不会被永久跳过；
+    - DOI 失效、文章页无下载链接 → 永久标记，下次运行直接跳过；
+    - 登录失效/网络异常等临时失败 → 下次运行重试；
     - 已有有效PDF的文章不会重复解析；
     - 避免一次性提取全部URL导致 token 过期。
     """
@@ -1156,6 +1381,7 @@ def phase_pipeline(args):
 
     chunk_size = max(1, getattr(args, "chunk_size", 20))
     articles = read_corpus_excel(EXCEL_FILE, SHEET_INDEX, only_chinese=True)
+    all_articles = articles
 
     if args.only_no_doi:
         log.warning("无DOI文章无法通过知网DOI解析，pipeline 阶段仅处理有DOI文章")
@@ -1164,35 +1390,61 @@ def phase_pipeline(args):
         articles = [a for a in articles if a["has_doi"]]
 
     progress = load_progress()
-    for key in ("downloaded", "failed", "no_pdf"):
-        progress.setdefault(key, set())
+    if getattr(args, "retry_failed", False):
+        n_unresolved = len(progress["unresolved"])
+        n_failed = len(progress["failed"])
+        progress["unresolved"].clear()
+        progress["failed"].clear()
+        progress["no_pdf"].clear()
+        save_progress(progress)
+        log.info(f"--retry-failed：已清空 {n_unresolved} 条永久未解决、"
+                 f"{n_failed} 条下载失败记录，本次重新解析")
 
     # 已有有效PDF的不再解析，避免重复劳动
     pdf_dir = os.path.join(OUTPUT_DIR, "PDFs")
     ensure_dir(pdf_dir)
-    pending = []
-    for a in articles:
-        if not a.get("doi") or a["doi"] in progress["downloaded"]:
-            continue
-        save_path = os.path.join(pdf_dir, make_filename(a["no"], a["title"]))
-        if is_valid_pdf(save_path):
-            progress["downloaded"].add(a["doi"])
-            continue
-        pending.append(a)
 
-    if args.max_articles:
-        pending = pending[:args.max_articles]
-    if not pending:
-        log.info("没有待处理的文章，退出")
-        return
-
-    log.info(f"待处理: {len(pending)} 篇，每批 {chunk_size} 篇")
-
+    # 加载并清理旧的 URL 记录（旧版本可能把 login_required 也写进去）
     existing = []
     if os.path.exists(DOWNLOAD_URLS_FILE):
         with open(DOWNLOAD_URLS_FILE, "r", encoding="utf-8") as f:
             existing = json.load(f)
+    existing, dropped = sanitize_url_records(existing)
+    if dropped:
+        with open(DOWNLOAD_URLS_FILE, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+        log.info(f"已清理 {dropped} 条旧的临时失败记录，将重新解析")
     url_index = {r.get("id"): i for i, r in enumerate(existing)}
+
+    unresolved = progress["unresolved"]
+    pending = []
+    seen = set()
+    for a in articles:
+        doi = a.get("doi")
+        if not doi or doi in seen:
+            continue
+        seen.add(doi)
+        if doi in progress["downloaded"]:
+            continue
+        save_path = os.path.join(pdf_dir, make_filename(a["no"], a["title"]))
+        if is_valid_pdf(save_path):
+            progress["downloaded"].add(doi)
+            unresolved.pop(doi, None)
+            continue
+        if doi in unresolved:
+            continue
+        pending.append(a)
+
+    save_progress(progress)
+
+    if args.max_articles:
+        pending = pending[:args.max_articles]
+    if not pending:
+        log.info(f"没有待处理的文章，退出（累计永久未解决 {len(unresolved)} 篇）")
+        return
+
+    log.info(f"待处理: {len(pending)} 篇，每批 {chunk_size} 篇"
+             f"（累计永久未解决 {len(unresolved)} 篇）")
 
     session = requests.Session()
     session.headers.update(HEADERS)
@@ -1203,6 +1455,7 @@ def phase_pipeline(args):
     ensure_dir(profile_dir)
 
     stats = {"ok": 0, "caj": 0, "failed": 0, "skipped": 0}
+    resolve_stats = {"ok": 0, "doi_not_found": 0, "no_pdf": 0, "transient": 0}
     batches = (len(pending) + chunk_size - 1) // chunk_size
 
     with sync_playwright() as p:
@@ -1228,9 +1481,20 @@ def phase_pipeline(args):
                 log.info(f"批次 {batch_no}/{batches}: 解析 {len(chunk)} 篇文章链接")
                 log.info("-" * 60)
 
-                records = extract_records_for_articles(
+                records, failures = extract_records_for_articles(
                     session, chunk, offset=start, total=len(pending)
                 )
+
+                # 永久失败落盘；临时失败只记日志，下次重试
+                permanent = [f for f in failures
+                             if f["status"] in PERMANENT_RESOLVE_STATUSES]
+                transient = len(failures) - len(permanent)
+                for f in permanent:
+                    unresolved[f["id"]] = f
+                resolve_stats["ok"] += len(records)
+                resolve_stats["transient"] += transient
+                for f in permanent:
+                    resolve_stats[f["status"]] = resolve_stats.get(f["status"], 0) + 1
 
                 # 合并/更新 URL 记录并落盘，便于中断后复查
                 for rec in records:
@@ -1243,19 +1507,43 @@ def phase_pipeline(args):
                 with open(DOWNLOAD_URLS_FILE, "w", encoding="utf-8") as f:
                     json.dump(existing, f, ensure_ascii=False, indent=2)
                 progress["urls"] = existing
+                if permanent:
+                    write_unresolved_csv(unresolved)
                 save_progress(progress)
 
-                log.info(f"批次 {batch_no}/{batches}: 下载 {len(records)} 篇 "
-                         f"（解析失败 {len(chunk) - len(records)} 篇，下次重试）")
+                log.info(
+                    f"批次 {batch_no}/{batches}: 解析成功 {len(records)} 篇；"
+                    f"永久跳过 {len(permanent)} 篇"
+                    f"（DOI失效 {sum(1 for f in permanent if f['status'] == 'doi_not_found')}，"
+                    f"无下载链接 {sum(1 for f in permanent if f['status'] == 'no_pdf')}）；"
+                    f"临时失败 {transient} 篇（下次重试）")
                 download_records_browser(context, page, downloads, records, args, progress, stats)
 
                 save_browser_cookies(context)
                 log.info(f"批次 {batch_no}/{batches} 完成 | 累计成功 {stats['ok']} | "
                          f"失败 {stats['failed']} | 跳过 {stats['skipped']}")
         finally:
-            # Ctrl+C 时也关闭浏览器，避免配置目录被遗留进程锁住
-            save_browser_cookies(context)
-            context.close()
+            # Ctrl+C 时也保存状态并关闭浏览器，避免进度/清单丢失
+            try:
+                write_unresolved_csv(unresolved)
+            except Exception as e:
+                log.warning(f"写入未解决清单失败: {e}")
+            try:
+                save_progress(progress)
+            except Exception as e:
+                log.warning(f"保存进度失败: {e}")
+            try:
+                write_download_manifest(all_articles, progress, pdf_dir)
+            except Exception as e:
+                log.warning(f"生成下载清单失败: {e}")
+            try:
+                save_browser_cookies(context)
+            except Exception as e:
+                log.warning(f"保存Cookie失败: {e}")
+            try:
+                context.close()
+            except Exception:
+                pass
 
     log.info("=" * 60)
     log.info("流水线完成:")
@@ -1263,6 +1551,13 @@ def phase_pipeline(args):
     log.info(f"  CAJ下载成功: {stats['caj']}")
     log.info(f"  下载失败: {stats['failed']}")
     log.info(f"  已跳过: {stats['skipped']}")
+    log.info(f"  本次解析成功: {resolve_stats['ok']}")
+    log.info(f"  本次永久跳过: {resolve_stats['doi_not_found'] + resolve_stats['no_pdf']} 篇"
+             f"（DOI失效 {resolve_stats['doi_not_found']}，"
+             f"无下载链接 {resolve_stats['no_pdf']}）")
+    log.info(f"  本次临时失败（下次重试）: {resolve_stats['transient']} 篇")
+    log.info(f"  累计永久未解决: {len(unresolved)} 篇")
+    log.info(f"  未解决清单: {UNRESOLVED_CSV}")
     log.info(f"  浏览器配置: {profile_dir}")
     log.info("=" * 60)
 
@@ -1528,7 +1823,7 @@ def main():
     parser.add_argument(
         "--retry-failed",
         action="store_true",
-        help="清空失败进度，重试此前失败的文章（requests 下载阶段生效）"
+        help="清空失败/永久未解决进度，重试此前失败的文章（extract、download、pipeline 阶段生效）"
     )
 
     args = parser.parse_args()
